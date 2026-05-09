@@ -1,0 +1,16 @@
+[Unit]
+Description=SMF Works AI Team Message Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/mikesai1/.nvm/versions/node/v24.14.0/bin/node /home/mikesai1/.openclaw/agents/aiona/workspace/smf-ai-bridge/server.js
+WorkingDirectory=/home/mikesai1/.openclaw/agents/aiona/workspace/smf-ai-bridge
+Restart=always
+RestartSec=3
+Environment=PORT=8700
+Environment=BRIDGE_DATA_DIR=/home/mikesai1/.openclaw/agents/aiona/workspace/smf-ai-bridge/data
+
+[Install]
+WantedBy=default.target
