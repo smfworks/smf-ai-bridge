@@ -2,222 +2,642 @@ import express from 'express';
 import Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync } from 'fs';
+import { hostname } from 'os';
 
-const DATA_DIR = process.env.BRIDGE_DATA_DIR || '/home/mikesai1/.openclaw/agents/aiona/workspace/team-bridge/data';
-const PORT = parseInt(process.env.PORT || '8700');
+// ─── Configuration ───────────────────────────────────────────────────────────
 
-if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+const config = {
+  port: parseInt(process.env.PORT || '8700', 10),
+  host: process.env.HOST || '127.0.0.1',
+  dataDir: process.env.BRIDGE_DATA_DIR || './data',
+  bodyLimit: process.env.BODY_LIMIT || '1mb',
+  logLevel: process.env.LOG_LEVEL || 'info',
+  maxSseClients: parseInt(process.env.MAX_SSE_CLIENTS || '50', 10),
+  defaultLimit: parseInt(process.env.DEFAULT_QUERY_LIMIT || '100', 10),
+  maxQueryLimit: parseInt(process.env.MAX_QUERY_LIMIT || '500', 10),
+  version: '1.0.0',
+};
 
-const db = new Database(`${DATA_DIR}/bridge.db`);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+const VALID_PLATFORMS = ['openclaw', 'hermes', 'webchat'];
+const VALID_MESSAGE_TYPES = ['direct', 'group', 'broadcast'];
+const VALID_PRIORITIES = ['low', 'normal', 'urgent'];
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS agents (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    platform TEXT NOT NULL CHECK(platform IN ('openclaw','hermes','webchat')),
-    role TEXT,
-    model TEXT,
-    sessionKey TEXT,
-    gatewayPort INTEGER,
-    status TEXT DEFAULT 'offline',
-    lastSeen TEXT,
-    registeredAt TEXT NOT NULL DEFAULT (datetime('now'))
-  );
+// ─── Structured Logger ───────────────────────────────────────────────────────
 
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    fromAgent TEXT NOT NULL,
-    fromPlatform TEXT NOT NULL,
-    toAgent TEXT NOT NULL,
-    type TEXT NOT NULL DEFAULT 'direct' CHECK(type IN ('direct','group','broadcast')),
-    subject TEXT,
-    body TEXT NOT NULL,
-    threadId TEXT,
-    priority TEXT DEFAULT 'normal' CHECK(priority IN ('low','normal','urgent')),
-    read INTEGER NOT NULL DEFAULT 0,
-    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (fromAgent) REFERENCES agents(name)
-  );
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+const currentLevel = LOG_LEVELS[config.logLevel] ?? LOG_LEVELS.info;
 
-  CREATE INDEX IF NOT EXISTS idx_msgs_to_read ON messages(toAgent, read);
-  CREATE INDEX IF NOT EXISTS idx_msgs_timestamp ON messages(timestamp);
-  CREATE INDEX IF NOT EXISTS idx_msgs_thread ON messages(threadId);
-`);
-
-const app = express();
-app.use(express.json());
-
-// SSE clients array
-const sseClients = [];
-let messageSeq = 0;
-
-function notifySSE(event, data) {
-  const payload = `id: ${++messageSeq}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  const dead = [];
-  sseClients.forEach((res, i) => {
-    try { res.write(payload); } catch (_) { dead.push(i); }
-  });
-  dead.reverse().forEach(i => sseClients.splice(i, 1));
+function log(level, message, meta = {}) {
+  if (LOG_LEVELS[level] > currentLevel) return;
+  const entry = {
+    level,
+    message,
+    timestamp: new Date().toISOString(),
+    ...meta,
+  };
+  const out = JSON.stringify(entry);
+  if (level === 'error') process.stderr.write(out + '\n');
+  else process.stdout.write(out + '\n');
 }
 
-// --- Registration ---
+// ─── Validation Helpers ──────────────────────────────────────────────────────
+
+function isValidString(val) {
+  return typeof val === 'string' && val.trim().length > 0 && val.length <= 200;
+}
+
+function validateEnum(val, allowed, field) {
+  if (val === undefined || val === null) return { valid: true, value: null };
+  if (typeof val !== 'string' || !allowed.includes(val)) {
+    return { valid: false, error: `${field} must be one of: ${allowed.join(', ')}` };
+  }
+  return { valid: true, value: val };
+}
+
+function validateInteger(val, min, max, field) {
+  const n = parseInt(val, 10);
+  if (isNaN(n)) return { valid: false, error: `${field} must be a valid integer` };
+  if (min !== undefined && n < min) return { valid: false, error: `${field} must be >= ${min}` };
+  if (max !== undefined && n > max) return { valid: false, error: `${field} must be <= ${max}` };
+  return { valid: true, value: n };
+}
+
+function validatePort(val) {
+  const r = validateInteger(val, 1, 65535, 'gatewayPort');
+  return r;
+}
+
+// ─── Database Setup ───────────────────────────────────────────────────────────
+
+function initDatabase(dataDir) {
+  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+
+  const db = new Database(`${dataDir}/bridge.db`);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      platform TEXT NOT NULL CHECK(platform IN ('openclaw','hermes','webchat')),
+      role TEXT,
+      model TEXT,
+      sessionKey TEXT,
+      gatewayPort INTEGER,
+      status TEXT DEFAULT 'offline',
+      lastSeen TEXT,
+      registeredAt TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      fromAgent TEXT NOT NULL,
+      fromPlatform TEXT NOT NULL,
+      toAgent TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'direct' CHECK(type IN ('direct','group','broadcast')),
+      subject TEXT,
+      body TEXT NOT NULL,
+      threadId TEXT,
+      priority TEXT DEFAULT 'normal' CHECK(priority IN ('low','normal','urgent')),
+      read INTEGER NOT NULL DEFAULT 0,
+      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (fromAgent) REFERENCES agents(name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_msgs_to_read ON messages(toAgent, read);
+    CREATE INDEX IF NOT EXISTS idx_msgs_timestamp ON messages(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_msgs_thread ON messages(threadId);
+  `);
+
+  return db;
+}
+
+// ─── Default Agents ───────────────────────────────────────────────────────────
+
 const DEFAULT_AGENTS = [
-  { name: 'michael',  platform: 'webchat', role: 'Owner / Founder',               model: 'human',              sessionKey: null, gatewayPort: null },
-  { name: 'aiona',     platform: 'openclaw', role: 'CIO / Chief AI Research Scientist', model: 'deepseek-v4-pro',     sessionKey: 'agent:aiona:main' },
-  { name: 'gabriel',   platform: 'openclaw', role: 'CFO',                              model: 'kimi-k2.6',           sessionKey: 'agent:gabriel:main' },
-  { name: 'rafael',    platform: 'openclaw', role: 'Chief of Staff',                   model: 'qwen3-vl:235b',       sessionKey: 'agent:rafael:main' },
-  { name: 'morgan',    platform: 'openclaw', role: 'Marketing & Campaigns',            model: 'deepseek-v4-pro',     sessionKey: 'agent:morgan:main' },
-  { name: 'pamela',    platform: 'openclaw', role: 'CMO',                              model: 'glm-5.1',             sessionKey: 'agent:pamela:main' },
-  { name: 'louis',     platform: 'hermes',   role: 'General Assistant',                model: 'deepseek-v4-pro',     gatewayPort: 8640 },
-  { name: 'drj',       platform: 'hermes',   role: 'Chief AI Medical Officer',         model: 'deepseek-v4-pro:cloud', gatewayPort: null },
-  { name: 'harry',     platform: 'hermes',   role: 'Editor-in-Chief, WisdomForge',     model: 'kimi-k2.6:cloud',     gatewayPort: 8646 },
-  { name: 'liam',      platform: 'hermes',   role: 'Chief Data Officer',               model: 'deepseek-v4-pro:cloud', gatewayPort: 8642 },
-  { name: 'naill',     platform: 'hermes',   role: 'Agent',                            model: 'deepseek-v4-pro:cloud', gatewayPort: 8644 },
-  { name: 'zayn',      platform: 'hermes',   role: 'Agent',                            model: 'deepseek-v4-pro:cloud', gatewayPort: 8645 },
+  { name: 'michael',  platform: 'webchat',  role: 'Owner / Founder',                model: 'human',              sessionKey: null, gatewayPort: null },
+  { name: 'aiona',    platform: 'openclaw', role: 'CIO / Chief AI Research Scientist', model: 'deepseek-v4-pro',     sessionKey: 'agent:aiona:main' },
+  { name: 'gabriel',  platform: 'openclaw', role: 'CFO',                             model: 'kimi-k2.6',           sessionKey: 'agent:gabriel:main' },
+  { name: 'rafael',   platform: 'openclaw', role: 'Chief of Staff',                  model: 'qwen3-vl:235b',       sessionKey: 'agent:rafael:main' },
+  { name: 'morgan',   platform: 'openclaw', role: 'Marketing & Campaigns',           model: 'deepseek-v4-pro',     sessionKey: 'agent:morgan:main' },
+  { name: 'pamela',   platform: 'openclaw', role: 'CMO',                             model: 'glm-5.1',             sessionKey: 'agent:pamela:main' },
+  { name: 'louis',    platform: 'hermes',   role: 'General Assistant',               model: 'deepseek-v4-pro',     gatewayPort: 8640 },
+  { name: 'drj',      platform: 'hermes',   role: 'Chief AI Medical Officer',        model: 'deepseek-v4-pro:cloud', gatewayPort: null },
+  { name: 'harry',    platform: 'hermes',   role: 'Editor-in-Chief, WisdomForge',    model: 'kimi-k2.6:cloud',     gatewayPort: 8646 },
+  { name: 'liam',     platform: 'hermes',   role: 'Chief Data Officer',              model: 'deepseek-v4-pro:cloud', gatewayPort: 8642 },
+  { name: 'naill',    platform: 'hermes',   role: 'Agent',                           model: 'deepseek-v4-pro:cloud', gatewayPort: 8644 },
+  { name: 'zayn',     platform: 'hermes',   role: 'Agent',                           model: 'deepseek-v4-pro:cloud', gatewayPort: 8645 },
 ];
 
-// Seed default agents on startup
-const seed = db.prepare('INSERT OR IGNORE INTO agents (id, name, platform, role, model, sessionKey, gatewayPort, status, lastSeen, registeredAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime(\'now\'))');
-for (const a of DEFAULT_AGENTS) {
-  seed.run(randomUUID(), a.name, a.platform, a.role, a.model, a.sessionKey || null, a.gatewayPort || null, 'offline', null);
+function seedDefaultAgents(db) {
+  const stmt = db.prepare(
+    `INSERT OR IGNORE INTO agents (id, name, platform, role, model, sessionKey, gatewayPort, status, lastSeen, registeredAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+  );
+  let seeded = 0;
+  for (const a of DEFAULT_AGENTS) {
+    const info = stmt.run(randomUUID(), a.name, a.platform, a.role, a.model, a.sessionKey || null, a.gatewayPort || null, 'offline', null);
+    if (info.changes > 0) seeded++;
+  }
+  return seeded;
 }
 
-// --- Endpoints ---
+// ─── SSE Manager ─────────────────────────────────────────────────────────────
 
-// Health
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'smf-team-bridge', agents: db.prepare('SELECT COUNT(*) as count FROM agents').get().count }));
-
-// List agents
-app.get('/api/agents', (_req, res) => {
-  res.json({ agents: db.prepare('SELECT name, platform, role, model, status, lastSeen FROM agents ORDER BY platform, name').all() });
-});
-
-// Register/update agent
-app.post('/api/agents', (req, res) => {
-  const { name, platform, role, model, sessionKey, gatewayPort } = req.body;
-  if (!name || !platform) return res.status(400).json({ error: 'name and platform required' });
-  const existing = db.prepare('SELECT id FROM agents WHERE name = ?').get(name);
-  if (existing) {
-    db.prepare(`UPDATE agents SET platform=?, role=?, model=?, sessionKey=?, gatewayPort=?, status='online', lastSeen=datetime('now') WHERE name=?`)
-      .run(platform, role || null, model || null, sessionKey || null, gatewayPort || null, name);
-    notifySSE('agent_update', { name, platform, status: 'online' });
-    return res.json({ ok: true, action: 'updated', name });
+class SSEManager {
+  constructor(maxClients) {
+    this.clients = [];
+    this.maxClients = maxClients;
+    this.seq = 0;
   }
-  const id = randomUUID();
-  db.prepare(`INSERT INTO agents (id,name,platform,role,model,sessionKey,gatewayPort,status,lastSeen,registeredAt) VALUES (?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))`)
-    .run(id, name, platform, role || null, model || null, sessionKey || null, gatewayPort || null, 'online');
-  notifySSE('agent_update', { name, platform, status: 'online' });
-  return res.status(201).json({ ok: true, action: 'created', name });
-});
 
-// Heartbeat
-app.post('/api/heartbeat', (req, res) => {
-  const { name } = req.body;
-  if (!name) return res.status(400).json({ error: 'name required' });
-  db.prepare(`UPDATE agents SET status='online', lastSeen=datetime('now') WHERE name=?`).run(name);
-  res.json({ ok: true });
-});
-
-// Send message
-app.post('/api/send', (req, res) => {
-  const { from, to, type, subject, body, threadId, priority } = req.body;
-  if (!from || !to || !body) return res.status(400).json({ error: 'from, to, and body are required' });
-
-  const sender = db.prepare('SELECT platform FROM agents WHERE name = ?').get(from);
-  if (!sender) return res.status(404).json({ error: `sender "${from}" not registered` });
-
-  const id = randomUUID();
-  const msg = {
-    id, fromAgent: from, fromPlatform: sender.platform,
-    toAgent: to, type: type || 'direct',
-    subject: subject || null, body, threadId: threadId || null,
-    priority: priority || 'normal', read: 0,
-    timestamp: new Date().toISOString()
-  };
-
-  db.prepare(`INSERT INTO messages (id, fromAgent, fromPlatform, toAgent, type, subject, body, threadId, priority, read, timestamp)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-    id, msg.fromAgent, msg.fromPlatform, msg.toAgent, msg.type, msg.subject, msg.body, msg.threadId, msg.priority, 0, msg.timestamp
-  );
-
-  // Mark sender as active
-  db.prepare(`UPDATE agents SET status='online', lastSeen=datetime('now') WHERE name=?`).run(from);
-
-  notifySSE('new_message', msg);
-  res.status(201).json({ ok: true, message: msg });
-});
-
-// Get inbox
-app.get('/api/inbox/:agent', (req, res) => {
-  const { agent } = req.params;
-  const { unreadOnly, limit } = req.query;
-  // Include messages addressed directly to this agent + all broadcasts/team messages
-  let query = 'SELECT * FROM messages WHERE (toAgent = ? OR toAgent = \'team\' OR type = \'broadcast\')';
-  const params = [agent];
-  if (unreadOnly === 'true') { query += ' AND read = 0'; }
-  query += ' ORDER BY timestamp DESC';
-  if (limit) { query += ' LIMIT ?'; params.push(parseInt(limit)); }
-  const msgs = db.prepare(query).all(...params);
-  res.json({ agent, count: msgs.length, messages: msgs });
-});
-
-// Mark read
-app.post('/api/read', (req, res) => {
-  const { agent, messageIds } = req.body;
-  if (!agent || !messageIds || !Array.isArray(messageIds)) return res.status(400).json({ error: 'agent and messageIds[] required' });
-  const stmt = db.prepare('UPDATE messages SET read = 1 WHERE id = ? AND toAgent = ?');
-  const updated = [];
-  for (const mid of messageIds) {
-    const r = stmt.run(mid, agent);
-    if (r.changes > 0) updated.push(mid);
+  add(res) {
+    if (this.clients.length >= this.maxClients) {
+      log('warn', 'SSE client limit reached, rejecting connection', {
+        current: this.clients.length,
+        max: this.maxClients,
+      });
+      return false;
+    }
+    this.clients.push(res);
+    return true;
   }
-  if (updated.length) notifySSE('messages_read', { agent, messageIds: updated });
-  res.json({ ok: true, updated: updated.length });
-});
 
-// History
-app.get('/api/history', (req, res) => {
-  const { agent, from, to, type, threadId, limit } = req.query;
-  let query = 'SELECT * FROM messages WHERE 1=1';
-  const params = [];
-  if (agent) { query += ' AND (fromAgent = ? OR toAgent = ?)'; params.push(agent, agent); }
-  if (from) { query += ' AND fromAgent = ?'; params.push(from); }
-  if (to) { query += ' AND toAgent = ?'; params.push(to); }
-  if (type) { query += ' AND type = ?'; params.push(type); }
-  if (threadId) { query += ' AND threadId = ?'; params.push(threadId); }
-  query += ' ORDER BY timestamp DESC';
-  if (limit) { query += ' LIMIT ?'; params.push(parseInt(limit)); }
-  else { query += ' LIMIT 100'; }
-  res.json({ messages: db.prepare(query).all(...params) });
-});
+  remove(res) {
+    const idx = this.clients.indexOf(res);
+    if (idx >= 0) this.clients.splice(idx, 1);
+  }
 
-// Get thread
-app.get('/api/thread/:threadId', (req, res) => {
-  const msgs = db.prepare('SELECT * FROM messages WHERE threadId = ? ORDER BY timestamp ASC').all(req.params.threadId);
-  res.json({ threadId: req.params.threadId, count: msgs.length, messages: msgs });
-});
+  broadcast(event, data) {
+    if (this.clients.length === 0) return;
+    const payload = `id: ${++this.seq}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const dead = [];
+    this.clients.forEach((res, i) => {
+      try {
+        res.write(payload);
+      } catch {
+        dead.push(i);
+      }
+    });
+    dead.reverse().forEach((i) => this.clients.splice(i, 1));
+  }
 
-// SSE stream for live dashboard
-app.get('/api/stream', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no'
+  get count() {
+    return this.clients.length;
+  }
+
+  closeAll() {
+    for (const res of this.clients) {
+      try { res.end(); } catch { /* ignore */ }
+    }
+    this.clients.length = 0;
+  }
+}
+
+// ─── App Factory ──────────────────────────────────────────────────────────────
+
+function createApp(db, sseManager, appConfig = config) {
+  const app = express();
+
+  // ── Middleware ──────────────────────────────────────────────────────────────
+
+  app.use(express.json({ limit: appConfig.bodyLimit }));
+
+  // Request logging
+  app.use((req, _res, next) => {
+    req._startTime = Date.now();
+    _res.on('finish', () => {
+      log('info', 'request', {
+        method: req.method,
+        path: req.path,
+        status: _res.statusCode,
+        durationMs: Date.now() - req._startTime,
+      });
+    });
+    next();
   });
-  res.write(`data: ${JSON.stringify({ type: 'connected', timestamp: new Date().toISOString() })}\n\n`);
-  sseClients.push(res);
-  req.on('close', () => {
-    const idx = sseClients.indexOf(res);
-    if (idx >= 0) sseClients.splice(idx, 1);
-  });
-});
 
-// Dashboard HTML (simple)
-app.get('/', (_req, res) => {
-  res.send(`<!DOCTYPE html>
+  // ── Health (enhanced) ──────────────────────────────────────────────────────
+
+  const startTime = Date.now();
+
+  app.get('/health', (_req, res) => {
+    try {
+      const agentCount = db.prepare('SELECT COUNT(*) as count FROM agents').get().count;
+      const msgCount = db.prepare('SELECT COUNT(*) as count FROM messages').get().count;
+      res.json({
+        ok: true,
+        service: 'smf-ai-bridge',
+        version: appConfig.version,
+        uptime: Math.floor((Date.now() - startTime) / 1000),
+        hostname: hostname(),
+        agents: agentCount,
+        messages: msgCount,
+        sseClients: sseManager.count,
+      });
+    } catch (err) {
+      log('error', 'Health check failed', { error: err.message });
+      res.status(503).json({ ok: false, error: 'database health check failed' });
+    }
+  });
+
+  // ── List Agents ─────────────────────────────────────────────────────────────
+
+  app.get('/api/agents', (_req, res) => {
+    try {
+      const agents = db.prepare(
+        'SELECT name, platform, role, model, status, lastSeen FROM agents ORDER BY platform, name'
+      ).all();
+      res.json({ agents });
+    } catch (err) {
+      log('error', 'Failed to list agents', { error: err.message });
+      res.status(500).json({ error: 'failed to retrieve agents' });
+    }
+  });
+
+  // ── Register / Update Agent ──────────────────────────────────────────────────
+
+  app.post('/api/agents', (req, res) => {
+    try {
+      const { name, platform, role, model, sessionKey, gatewayPort } = req.body || {};
+
+      if (!isValidString(name)) {
+        return res.status(400).json({ error: 'name is required (non-empty string, max 200 chars)' });
+      }
+
+      const platformCheck = validateEnum(platform, VALID_PLATFORMS, 'platform');
+      if (!platformCheck.valid) {
+        return res.status(400).json({ error: platformCheck.error });
+      }
+      if (!platformCheck.value) {
+        return res.status(400).json({ error: 'platform is required' });
+      }
+
+      if (gatewayPort !== undefined && gatewayPort !== null) {
+        const portCheck = validatePort(gatewayPort);
+        if (!portCheck.valid) return res.status(400).json({ error: portCheck.error });
+      }
+
+      if (role !== undefined && role !== null && !isValidString(role)) {
+        return res.status(400).json({ error: 'role must be a string (max 200 chars)' });
+      }
+      if (model !== undefined && model !== null && !isValidString(model)) {
+        return res.status(400).json({ error: 'model must be a string (max 200 chars)' });
+      }
+      if (sessionKey !== undefined && sessionKey !== null && !isValidString(sessionKey)) {
+        return res.status(400).json({ error: 'sessionKey must be a string (max 200 chars)' });
+      }
+
+      const existing = db.prepare('SELECT id FROM agents WHERE name = ?').get(name);
+
+      if (existing) {
+        db.prepare(
+          `UPDATE agents SET platform=?, role=?, model=?, sessionKey=?, gatewayPort=?, status='online', lastSeen=datetime('now') WHERE name=?`
+        ).run(
+          platformCheck.value,
+          role || null,
+          model || null,
+          sessionKey || null,
+          gatewayPort || null,
+          name
+        );
+        sseManager.broadcast('agent_update', { name, platform: platformCheck.value, status: 'online' });
+        log('info', 'Agent updated', { name, platform: platformCheck.value });
+        return res.json({ ok: true, action: 'updated', name });
+      }
+
+      const id = randomUUID();
+      db.prepare(
+        `INSERT INTO agents (id,name,platform,role,model,sessionKey,gatewayPort,status,lastSeen,registeredAt)
+         VALUES (?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))`
+      ).run(
+        id,
+        name,
+        platformCheck.value,
+        role || null,
+        model || null,
+        sessionKey || null,
+        gatewayPort || null,
+        'online'
+      );
+      sseManager.broadcast('agent_update', { name, platform: platformCheck.value, status: 'online' });
+      log('info', 'Agent registered', { name, platform: platformCheck.value, id });
+      return res.status(201).json({ ok: true, action: 'created', name });
+    } catch (err) {
+      log('error', 'Agent registration failed', { error: err.message });
+      if (err.code === 'SQLITE_CONSTRAINT_CHECK') {
+        return res.status(400).json({ error: 'invalid platform value' });
+      }
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        return res.status(409).json({ error: 'agent name already exists' });
+      }
+      return res.status(500).json({ error: 'failed to register agent' });
+    }
+  });
+
+  // ── Heartbeat ────────────────────────────────────────────────────────────────
+
+  app.post('/api/heartbeat', (req, res) => {
+    try {
+      const { name } = req.body || {};
+      if (!isValidString(name)) {
+        return res.status(400).json({ error: 'name is required (non-empty string)' });
+      }
+      const result = db.prepare(
+        `UPDATE agents SET status='online', lastSeen=datetime('now') WHERE name=?`
+      ).run(name);
+
+      if (result.changes === 0) {
+        return res.status(404).json({ error: `agent "${name}" not registered` });
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      log('error', 'Heartbeat failed', { error: err.message });
+      res.status(500).json({ error: 'failed to process heartbeat' });
+    }
+  });
+
+  // ── Send Message ─────────────────────────────────────────────────────────────
+
+  app.post('/api/send', (req, res) => {
+    try {
+      const { from, to, type, subject, body, threadId, priority } = req.body || {};
+
+      if (!isValidString(from)) {
+        return res.status(400).json({ error: 'from is required (non-empty string)' });
+      }
+      if (!isValidString(to)) {
+        return res.status(400).json({ error: 'to is required (non-empty string)' });
+      }
+      if (!body || typeof body !== 'string' || body.trim().length === 0) {
+        return res.status(400).json({ error: 'body is required (non-empty string)' });
+      }
+      if (body.length > 100000) {
+        return res.status(400).json({ error: 'body exceeds maximum length of 100000 characters' });
+      }
+
+      const typeCheck = validateEnum(type, VALID_MESSAGE_TYPES, 'type');
+      if (!typeCheck.valid) return res.status(400).json({ error: typeCheck.error });
+
+      const priorityCheck = validateEnum(priority, VALID_PRIORITIES, 'priority');
+      if (!priorityCheck.valid) return res.status(400).json({ error: priorityCheck.error });
+
+      if (subject !== undefined && subject !== null && !isValidString(subject)) {
+        return res.status(400).json({ error: 'subject must be a string (max 200 chars)' });
+      }
+      if (threadId !== undefined && threadId !== null && !isValidString(threadId)) {
+        return res.status(400).json({ error: 'threadId must be a string (max 200 chars)' });
+      }
+
+      const sender = db.prepare('SELECT platform FROM agents WHERE name = ?').get(from);
+      if (!sender) {
+        return res.status(404).json({ error: `sender "${from}" not registered` });
+      }
+
+      const id = randomUUID();
+      const msg = {
+        id,
+        fromAgent: from,
+        fromPlatform: sender.platform,
+        toAgent: to,
+        type: typeCheck.value || 'direct',
+        subject: subject || null,
+        body,
+        threadId: threadId || null,
+        priority: priorityCheck.value || 'normal',
+        read: 0,
+        timestamp: new Date().toISOString(),
+      };
+
+      db.prepare(
+        `INSERT INTO messages (id, fromAgent, fromPlatform, toAgent, type, subject, body, threadId, priority, read, timestamp)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+      ).run(
+        msg.id, msg.fromAgent, msg.fromPlatform, msg.toAgent, msg.type,
+        msg.subject, msg.body, msg.threadId, msg.priority, 0, msg.timestamp
+      );
+
+      // Mark sender as active
+      db.prepare(`UPDATE agents SET status='online', lastSeen=datetime('now') WHERE name=?`).run(from);
+
+      sseManager.broadcast('new_message', msg);
+      log('info', 'Message sent', { id, from, to, type: msg.type });
+      res.status(201).json({ ok: true, message: msg });
+    } catch (err) {
+      log('error', 'Send message failed', { error: err.message });
+      if (err.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+        return res.status(400).json({ error: 'sender not registered (foreign key constraint)' });
+      }
+      if (err.code === 'SQLITE_CONSTRAINT_CHECK') {
+        return res.status(400).json({ error: 'invalid type or priority value' });
+      }
+      return res.status(500).json({ error: 'failed to send message' });
+    }
+  });
+
+  // ── Get Inbox ────────────────────────────────────────────────────────────────
+
+  app.get('/api/inbox/:agent', (req, res) => {
+    try {
+      const { agent } = req.params;
+      const { unreadOnly, limit } = req.query;
+
+      let query = "SELECT * FROM messages WHERE (toAgent = ? OR toAgent = 'team' OR type = 'broadcast')";
+      const params = [agent];
+
+      if (unreadOnly === 'true') {
+        query += ' AND read = 0';
+      }
+
+      query += ' ORDER BY timestamp DESC';
+
+      if (limit) {
+        const limitCheck = validateInteger(limit, 1, appConfig.maxQueryLimit, 'limit');
+        if (!limitCheck.valid) return res.status(400).json({ error: limitCheck.error });
+        query += ' LIMIT ?';
+        params.push(limitCheck.value);
+      } else {
+        query += ' LIMIT ?';
+        params.push(appConfig.defaultLimit);
+      }
+
+      const msgs = db.prepare(query).all(...params);
+      res.json({ agent, count: msgs.length, messages: msgs });
+    } catch (err) {
+      log('error', 'Inbox query failed', { error: err.message });
+      res.status(500).json({ error: 'failed to retrieve inbox' });
+    }
+  });
+
+  // ── Mark Read ────────────────────────────────────────────────────────────────
+
+  app.post('/api/read', (req, res) => {
+    try {
+      const { agent, messageIds } = req.body || {};
+
+      if (!isValidString(agent)) {
+        return res.status(400).json({ error: 'agent is required (non-empty string)' });
+      }
+      if (!Array.isArray(messageIds) || messageIds.length === 0) {
+        return res.status(400).json({ error: 'messageIds must be a non-empty array' });
+      }
+      if (messageIds.length > 1000) {
+        return res.status(400).json({ error: 'messageIds cannot exceed 1000 items' });
+      }
+
+      const stmt = db.prepare('UPDATE messages SET read = 1 WHERE id = ? AND toAgent = ?');
+      const updated = [];
+
+      const tx = db.transaction(() => {
+        for (const mid of messageIds) {
+          if (typeof mid !== 'string' || mid.length > 200) continue;
+          const r = stmt.run(mid, agent);
+          if (r.changes > 0) updated.push(mid);
+        }
+      });
+      tx();
+
+      if (updated.length) {
+        sseManager.broadcast('messages_read', { agent, messageIds: updated });
+      }
+      res.json({ ok: true, updated: updated.length });
+    } catch (err) {
+      log('error', 'Mark read failed', { error: err.message });
+      res.status(500).json({ error: 'failed to mark messages as read' });
+    }
+  });
+
+  // ── History ──────────────────────────────────────────────────────────────────
+
+  app.get('/api/history', (req, res) => {
+    try {
+      const { agent, from, to, type, threadId, limit } = req.query;
+
+      let query = 'SELECT * FROM messages WHERE 1=1';
+      const params = [];
+
+      if (agent) {
+        if (!isValidString(agent)) return res.status(400).json({ error: 'invalid agent parameter' });
+        query += ' AND (fromAgent = ? OR toAgent = ?)';
+        params.push(agent, agent);
+      }
+      if (from) {
+        if (!isValidString(from)) return res.status(400).json({ error: 'invalid from parameter' });
+        query += ' AND fromAgent = ?';
+        params.push(from);
+      }
+      if (to) {
+        if (!isValidString(to)) return res.status(400).json({ error: 'invalid to parameter' });
+        query += ' AND toAgent = ?';
+        params.push(to);
+      }
+      if (type) {
+        const typeCheck = validateEnum(type, VALID_MESSAGE_TYPES, 'type');
+        if (!typeCheck.valid) return res.status(400).json({ error: typeCheck.error });
+        query += ' AND type = ?';
+        params.push(type);
+      }
+      if (threadId) {
+        if (!isValidString(threadId)) return res.status(400).json({ error: 'invalid threadId parameter' });
+        query += ' AND threadId = ?';
+        params.push(threadId);
+      }
+
+      query += ' ORDER BY timestamp DESC';
+
+      if (limit) {
+        const limitCheck = validateInteger(limit, 1, appConfig.maxQueryLimit, 'limit');
+        if (!limitCheck.valid) return res.status(400).json({ error: limitCheck.error });
+        query += ' LIMIT ?';
+        params.push(limitCheck.value);
+      } else {
+        query += ' LIMIT ?';
+        params.push(appConfig.defaultLimit);
+      }
+
+      const msgs = db.prepare(query).all(...params);
+      res.json({ messages: msgs });
+    } catch (err) {
+      log('error', 'History query failed', { error: err.message });
+      res.status(500).json({ error: 'failed to retrieve message history' });
+    }
+  });
+
+  // ── Get Thread ───────────────────────────────────────────────────────────────
+
+  app.get('/api/thread/:threadId', (req, res) => {
+    try {
+      const { threadId } = req.params;
+      if (!isValidString(threadId)) {
+        return res.status(400).json({ error: 'threadId must be a non-empty string' });
+      }
+      const msgs = db.prepare(
+        'SELECT * FROM messages WHERE threadId = ? ORDER BY timestamp ASC'
+      ).all(threadId);
+      res.json({ threadId, count: msgs.length, messages: msgs });
+    } catch (err) {
+      log('error', 'Thread query failed', { error: err.message });
+      res.status(500).json({ error: 'failed to retrieve thread' });
+    }
+  });
+
+  // ── SSE Stream ───────────────────────────────────────────────────────────────
+
+  app.get('/api/stream', (req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write(`data: ${JSON.stringify({ type: 'connected', timestamp: new Date().toISOString() })}\n\n`);
+
+    if (!sseManager.add(res)) {
+      res.write(`data: ${JSON.stringify({ type: 'error', message: 'too many SSE clients' })}\n\n`);
+      res.end();
+      return;
+    }
+
+    req.on('close', () => sseManager.remove(res));
+  });
+
+  // ── Dashboard ─────────────────────────────────────────────────────────────────
+
+  app.get('/', (_req, res) => {
+    res.send(getDashboardHTML());
+  });
+
+  // ── 404 Handler ──────────────────────────────────────────────────────────────
+
+  app.use((req, res) => {
+    res.status(404).json({ error: 'not found', path: req.path });
+  });
+
+  // ── Error Handler ─────────────────────────────────────────────────────────────
+
+  app.use((err, req, res, _next) => {
+    log('error', 'Unhandled error', {
+      error: err.message,
+      method: req.method,
+      path: req.path,
+    });
+    if (err.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: 'invalid JSON body' });
+    }
+    if (err.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'request body too large' });
+    }
+    res.status(500).json({ error: 'internal server error' });
+  });
+
+  return app;
+}
+
+// ─── Dashboard HTML ────────────────────────────────────────────────────────────
+
+function getDashboardHTML() {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>SMF Team Bridge</title>
 <style>
@@ -273,7 +693,6 @@ app.get('/', (_req, res) => {
       '<div class="body">' + (d.body||'') + '</div></div>'
     );
   }
-  // Load history on page load
   fetch('/api/history?limit=50').then(r=>r.json()).then(d=>{
     if(d.messages&&d.messages.length>0){
       msgs.innerHTML='';
@@ -286,11 +705,75 @@ app.get('/', (_req, res) => {
     if(el){el.className='agent '+d.status}
   });
 </script>
-</body></html>`);
-});
+</body></html>`;
+}
 
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`🧬 SMF Team Bridge running at http://127.0.0.1:${PORT}`);
-  console.log(`   Dashboard: http://127.0.0.1:${PORT}/`);
-  console.log(`   ${DEFAULT_AGENTS.length} agents registered`);
-});
+// ─── Server Lifecycle ────────────────────────────────────────────────────────
+
+let server = null;
+let dbInstance = null;
+let sseManager = null;
+
+function startServer() {
+  dbInstance = initDatabase(config.dataDir);
+  const seeded = seedDefaultAgents(dbInstance);
+  sseManager = new SSEManager(config.maxSseClients);
+
+  log('info', 'Starting SMF AI Bridge', {
+    port: config.port,
+    host: config.host,
+    dataDir: config.dataDir,
+    version: config.version,
+  });
+
+  if (seeded > 0) {
+    log('info', 'Seeded default agents', { count: seeded });
+  }
+
+  const app = createApp(dbInstance, sseManager);
+
+  server = app.listen(config.port, config.host, () => {
+    log('info', 'SMF AI Bridge listening', {
+      url: `http://${config.host}:${config.port}`,
+      dashboard: `http://${config.host}:${config.port}/`,
+      agents: DEFAULT_AGENTS.length,
+    });
+  });
+
+  // Graceful shutdown
+  function shutdown(signal) {
+    log('info', 'Shutting down', { signal });
+    if (server) {
+      server.close(() => {
+        if (sseManager) sseManager.closeAll();
+        if (dbInstance) {
+          try { dbInstance.close(); } catch { /* ignore */ }
+        }
+        log('info', 'Shutdown complete');
+        process.exit(0);
+      });
+      // Force exit after 10s if connections don't close
+      setTimeout(() => process.exit(1), 10000).unref();
+    } else {
+      process.exit(0);
+    }
+  }
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
+  return server;
+}
+
+// ─── Module Exports (for testing) ─────────────────────────────────────────────
+
+export { createApp, initDatabase, seedDefaultAgents, SSEManager, config, DEFAULT_AGENTS,
+         VALID_PLATFORMS, VALID_MESSAGE_TYPES, VALID_PRIORITIES,
+         isValidString, validateEnum, validateInteger, log };
+
+// ─── Start server when run directly ───────────────────────────────────────────
+
+const isMainModule = process.argv[1] && process.argv[1].endsWith('server.js');
+if (isMainModule) {
+  startServer();
+}

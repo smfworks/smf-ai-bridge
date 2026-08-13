@@ -1,12 +1,21 @@
 {
-  "name": "smf-team-bridge",
+  "name": "smf-ai-bridge",
   "version": "1.0.0",
-  "private": true,
+  "description": "On-machine communication bridge for inter-AI messaging between OpenClaw and Hermes agents",
+  "main": "server.js",
   "type": "module",
-  "description": "SMF Works AI Team Message Bus — unified communication layer for OpenClaw + Hermes agents",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js",
+    "test:verbose": "node --test --test-reporter=spec test/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.js"
+  },
   "dependencies": {
     "better-sqlite3": "^11.10.0",
-    "express": "^5.2.1",
-    "uuid": "^11.1.1"
+    "express": "^5.2.1"
   }
 }

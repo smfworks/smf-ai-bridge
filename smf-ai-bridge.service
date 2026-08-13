@@ -5,12 +5,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/mikesai1/.nvm/versions/node/v24.14.0/bin/node /home/mikesai1/.openclaw/agents/aiona/workspace/smf-ai-bridge/server.js
-WorkingDirectory=/home/mikesai1/.openclaw/agents/aiona/workspace/smf-ai-bridge
+# NOTE: Update these paths to match your installation
+ExecStart=/usr/bin/env node /opt/smf-ai-bridge/server.js
+WorkingDirectory=/opt/smf-ai-bridge
 Restart=always
 RestartSec=3
+
+# Environment configuration
 Environment=PORT=8700
-Environment=BRIDGE_DATA_DIR=/home/mikesai1/.openclaw/agents/aiona/workspace/smf-ai-bridge/data
+Environment=HOST=127.0.0.1
+Environment=BRIDGE_DATA_DIR=/opt/smf-ai-bridge/data
+Environment=LOG_LEVEL=info
+Environment=MAX_SSE_CLIENTS=50
+
+# Graceful shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target
