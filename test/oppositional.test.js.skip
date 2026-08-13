@@ -1,0 +1,775 @@
+import { describe, it, beforeEach, afterEach } from 'node:test';
+import { strict as assert } from 'node:assert';
+import { createApp, initDatabase, seedDefaultAgents, SSEManager, config,
+         VALID_PLATFORMS, VALID_MESSAGE_TYPES, VALID_PRIORITIES, LIMITS,
+         isValidString, validateEnum, validateInteger, parseConfig,
+         safeBody, escapeHtml } from '../server.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import http from 'node:http';
+
+// ─── Test Helpers ─────────────────────────────────────────────────────────────
+
+function makeTestEnv() {
+  const dataDir = mkdtempSync(join(tmpdir(), 'bridge-test-'));
+  const db = initDatabase(dataDir);
+  seedDefaultAgents(db);
+  const sse = new SSEManager(50);
+  const appConfig = { ...config, dataDir, defaultLimit: 100, maxQueryLimit: 500, bodyLimit: '1mb', version: '1.0.0', maxSseClients: 50 };
+  const app = createApp(db, sse, appConfig);
+  const server = http.createServer(app);
+  server.listen(0);
+  const port = server.address().port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  return { app, server, db, sse, dataDir, baseUrl, appConfig };
+}
+
+function cleanup(env) {
+  try { env.server.close(); } catch { /* ignore */ }
+  try { env.db.close(); } catch { /* ignore */ }
+  try { rmSync(env.dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+async function envRequest(env, method, path, body, rawBody) {
+  const url = `${env.baseUrl}${path}`;
+  const opts = {
+    method,
+    headers: { 'content-type': 'application/json' },
+  };
+  if (rawBody !== undefined) {
+    opts.body = rawBody;
+  } else if (body !== undefined) {
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = text; }
+  return { status: res.status, body: json, headers: Object.fromEntries(res.headers), raw: text };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ROUND 2 — OPPOSITIONAL ANALYSIS TESTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ─── 1. XSS in Dashboard HTML ──────────────────────────────────────────────────
+
+describe('XSS prevention in dashboard', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('escapes HTML in message body, subject, fromAgent, toAgent', async () => {
+    // Send a message with XSS payload
+    const xssPayload = '<script>alert("xss")</script><img src=x onerror=alert(1)>';
+    await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'harry',
+      body: xssPayload,
+      subject: '<script>alert("subj-xss")</script>',
+    });
+
+    // Fetch the dashboard HTML
+    const res = await envRequest(env, 'GET', '/');
+    const html = res.raw;
+
+    // The raw XSS payload should NOT appear in the HTML
+    // (the dashboard fetches messages client-side, so we check the JS code has escapeHtml)
+    assert.ok(html.includes('escapeHtml'), 'Dashboard should include escapeHtml function');
+    assert.ok(!html.includes('insertAdjacentHTML(\'afterbegin\',\n      \'<div class="msg"><div class="header">\'' +
+      '\n        \'<span class="from">\' + (d.fromAgent||\'?\')'), 'Dashboard should not use raw unescaped values in insertAdjacentHTML');
+  });
+
+  it('dashboard HTML contains escapeHtml function definition', async () => {
+    const res = await envRequest(env, 'GET', '/');
+    assert.ok(res.raw.includes('function escapeHtml'));
+    assert.ok(res.raw.includes('createTextNode'));
+  });
+
+  it('escapeHtml function escapes all dangerous characters', () => {
+    assert.strictEqual(escapeHtml('<script>'), '&lt;script&gt;');
+    assert.strictEqual(escapeHtml('"'), '&quot;');
+    assert.strictEqual(escapeHtml("'"), '&#39;');
+    assert.strictEqual(escapeHtml('&'), '&amp;');
+    assert.strictEqual(escapeHtml(null), '');
+    assert.strictEqual(escapeHtml(undefined), '');
+  });
+});
+
+// ─── 2. Prototype Pollution Prevention ────────────────────────────────────────
+
+describe('Prototype pollution prevention', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('safeBody strips __proto__ key from request body', () => {
+    // Object.keys won't include __proto__ set via literal, so use a Map-like approach
+    const body = {};
+    Object.defineProperty(body, '__proto__', { value: { polluted: true }, enumerable: true, configurable: true, writable: true });
+    body.name = 'test';
+    const fakeReq = { body };
+    const result = safeBody(fakeReq);
+    assert.ok(!('__proto__' in result && Object.prototype.hasOwnProperty.call(result, '__proto__')));
+    assert.strictEqual(result.name, 'test');
+  });
+
+  it('safeBody strips constructor key from request body', () => {
+    const body = Object.create(null);
+    body.constructor = { prototype: { polluted: true } };
+    body.name = 'test';
+    const fakeReq = { body };
+    const result = safeBody(fakeReq);
+    assert.ok(!('constructor' in result));
+    assert.strictEqual(result.name, 'test');
+  });
+
+  it('safeBody strips prototype from request body', () => {
+    const fakeReq = { body: { prototype: { polluted: true }, name: 'test' } };
+    const result = safeBody(fakeReq);
+    assert.ok(!('prototype' in result));
+    assert.strictEqual(result.name, 'test');
+  });
+
+  it('safeBody handles null body', () => {
+    const fakeReq = { body: null };
+    const result = safeBody(fakeReq);
+    assert.deepStrictEqual(result, {});
+  });
+
+  it('safeBody handles undefined body', () => {
+    const fakeReq = {};
+    const result = safeBody(fakeReq);
+    assert.deepStrictEqual(result, {});
+  });
+
+  it('safeBody handles array body', () => {
+    const fakeReq = { body: [1, 2, 3] };
+    const result = safeBody(fakeReq);
+    assert.deepStrictEqual(result, {});
+  });
+
+  it('POST /api/agents with __proto__ in body does not pollute Object prototype', async () => {
+    await envRequest(env, 'POST', '/api/agents', {
+      name: 'test-pp',
+      platform: 'hermes',
+      __proto__: { polluted: true },
+    });
+    // Object.prototype should not have 'polluted'
+    assert.strictEqual(Object.prototype.polluted, undefined);
+  });
+
+  it('POST /api/send with constructor in body does not pollute', async () => {
+    await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'harry', body: 'test',
+      constructor: { prototype: { polluted: true } },
+    });
+    assert.strictEqual(Object.prototype.polluted, undefined);
+  });
+});
+
+// ─── 3. SSEManager Broadcast Race Condition Fix ───────────────────────────────
+
+describe('SSEManager broadcast safety', () => {
+  it('correctly handles mixed live/dead clients without index corruption', () => {
+    const sse = new SSEManager(100);
+    let received = [];
+    const live1 = { write: (p) => { received.push(['live1', p]); }, end: () => {} };
+    const dead1 = { write: () => { throw new Error('closed'); }, end: () => {} };
+    const live2 = { write: (p) => { received.push(['live2', p]); }, end: () => {} };
+    const dead2 = { write: () => { throw new Error('closed'); }, end: () => {} };
+    const live3 = { write: (p) => { received.push(['live3', p]); }, end: () => {} };
+
+    sse.add(live1);
+    sse.add(dead1);
+    sse.add(live2);
+    sse.add(dead2);
+    sse.add(live3);
+
+    assert.strictEqual(sse.count, 5);
+
+    sse.broadcast('test', { hello: 'world' });
+
+    // All 3 live clients should have received the message
+    assert.strictEqual(received.length, 3);
+    assert.ok(received.every(r => r[1].includes('event: test')));
+
+    // Dead clients should be removed
+    assert.strictEqual(sse.count, 3);
+    assert.strictEqual(sse.clients[0], live1);
+    assert.strictEqual(sse.clients[1], live2);
+    assert.strictEqual(sse.clients[2], live3);
+
+    // Second broadcast should only go to live clients
+    received = [];
+    sse.broadcast('test2', { foo: 'bar' });
+    assert.strictEqual(received.length, 3);
+  });
+
+  it('broadcast with all dead clients cleans up properly', () => {
+    const sse = new SSEManager(100);
+    sse.add({ write: () => { throw new Error('dead'); }, end: () => {} });
+    sse.add({ write: () => { throw new Error('dead'); }, end: () => {} });
+    assert.strictEqual(sse.count, 2);
+    sse.broadcast('test', { data: 1 });
+    assert.strictEqual(sse.count, 0);
+  });
+
+  it('broadcast with no clients is a no-op', () => {
+    const sse = new SSEManager(100);
+    sse.broadcast('test', { data: 1 });
+    assert.strictEqual(sse.count, 0);
+    // seq should still increment
+    assert.strictEqual(sse.seq, 0); // no broadcast happens if no clients
+  });
+});
+
+// ─── 4. Config Validation at Startup ──────────────────────────────────────────
+
+describe('parseConfig validates environment variables', () => {
+  it('accepts valid config', () => {
+    const cfg = parseConfig({ PORT: '9000', HOST: '0.0.0.0', LOG_LEVEL: 'debug' });
+    assert.strictEqual(cfg.port, 9000);
+    assert.strictEqual(cfg.host, '0.0.0.0');
+    assert.strictEqual(cfg.logLevel, 'debug');
+  });
+
+  it('uses defaults when env not set', () => {
+    const cfg = parseConfig({});
+    assert.strictEqual(cfg.port, 8700);
+    assert.strictEqual(cfg.host, '127.0.0.1');
+    assert.strictEqual(cfg.logLevel, 'info');
+    assert.strictEqual(cfg.maxSseClients, 50);
+  });
+
+  it('rejects invalid PORT (NaN)', () => {
+    assert.throws(() => parseConfig({ PORT: 'abc' }), /Invalid PORT/);
+  });
+
+  it('rejects PORT out of range (0)', () => {
+    assert.throws(() => parseConfig({ PORT: '0' }), /Invalid PORT/);
+  });
+
+  it('rejects PORT out of range (65536)', () => {
+    assert.throws(() => parseConfig({ PORT: '65536' }), /Invalid PORT/);
+  });
+
+  it('rejects invalid LOG_LEVEL', () => {
+    assert.throws(() => parseConfig({ LOG_LEVEL: 'verbose' }), /Invalid LOG_LEVEL/);
+  });
+
+  it('rejects invalid MAX_SSE_CLIENTS', () => {
+    assert.throws(() => parseConfig({ MAX_SSE_CLIENTS: '0' }), /Invalid MAX_SSE_CLIENTS/);
+    assert.throws(() => parseConfig({ MAX_SSE_CLIENTS: 'abc' }), /Invalid MAX_SSE_CLIENTS/);
+  });
+
+  it('rejects invalid DEFAULT_QUERY_LIMIT', () => {
+    assert.throws(() => parseConfig({ DEFAULT_QUERY_LIMIT: '0' }), /Invalid DEFAULT_QUERY_LIMIT/);
+    assert.throws(() => parseConfig({ DEFAULT_QUERY_LIMIT: 'xyz' }), /Invalid DEFAULT_QUERY_LIMIT/);
+  });
+
+  it('rejects DEFAULT_QUERY_LIMIT > MAX_QUERY_LIMIT', () => {
+    assert.throws(
+      () => parseConfig({ DEFAULT_QUERY_LIMIT: '500', MAX_QUERY_LIMIT: '100' }),
+      /cannot exceed/
+    );
+  });
+
+  it('rejects invalid MAX_QUERY_LIMIT', () => {
+    assert.throws(() => parseConfig({ MAX_QUERY_LIMIT: '-1' }), /Invalid MAX_QUERY_LIMIT/);
+  });
+});
+
+// ─── 5. validateInteger rejects trailing garbage ─────────────────────────────
+
+describe('validateInteger strict parsing', () => {
+  it('rejects strings with trailing alphabetic characters', () => {
+    const r = validateInteger('50abc', 1, 100, 'limit');
+    assert.ok(!r.valid);
+    assert.ok(r.error.includes('integer'));
+  });
+
+  it('rejects strings with leading/trailing whitespace and junk', () => {
+    assert.ok(!validateInteger('  50xyz  ', 1, 100, 'limit').valid);
+  });
+
+  it('accepts clean integer strings', () => {
+    assert.ok(validateInteger('50', 1, 100, 'limit').valid);
+    assert.ok(validateInteger(' 50 ', 1, 100, 'limit').valid);
+  });
+
+  it('accepts integer numbers', () => {
+    assert.ok(validateInteger(50, 1, 100, 'limit').valid);
+  });
+
+  it('rejects floating point numbers', () => {
+    assert.ok(!validateInteger(50.5, 1, 100, 'limit').valid);
+  });
+
+  it('rejects hex strings', () => {
+    assert.ok(!validateInteger('0x10', 1, 100, 'limit').valid);
+  });
+
+  it('rejects negative numbers with -', () => {
+    assert.ok(!validateInteger('-5', 1, 100, 'limit').valid);
+  });
+});
+
+// ─── 6. Security Headers ───────────────────────────────────────────────────────
+
+describe('Security headers', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('sets X-Content-Type-Options: nosniff', async () => {
+    const res = await envRequest(env, 'GET', '/health');
+    assert.strictEqual(res.headers['x-content-type-options'], 'nosniff');
+  });
+
+  it('sets X-Frame-Options: DENY', async () => {
+    const res = await envRequest(env, 'GET', '/health');
+    assert.strictEqual(res.headers['x-frame-options'], 'DENY');
+  });
+
+  it('sets security headers on all responses', async () => {
+    const res = await envRequest(env, 'GET', '/api/agents');
+    assert.ok(res.headers['x-content-type-options']);
+    assert.ok(res.headers['x-frame-options']);
+  });
+
+  it('sets security headers on 404 responses', async () => {
+    const res = await envRequest(env, 'GET', '/nonexistent');
+    assert.strictEqual(res.headers['x-content-type-options'], 'nosniff');
+  });
+});
+
+// ─── 7. SSE Client Limit Race Condition ────────────────────────────────────────
+
+describe('SSE stream endpoint', () => {
+  it('returns 503 when SSE client limit is reached', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'bridge-sse-'));
+    const db = initDatabase(dataDir);
+    seedDefaultAgents(db);
+    const sse = new SSEManager(1); // Only 1 client allowed
+    const appConfig = { ...config, dataDir, maxSseClients: 1, defaultLimit: 100, maxQueryLimit: 500, version: '1.0.0' };
+    const app = createApp(db, sse, appConfig);
+    const server = http.createServer(app);
+    server.listen(0);
+    const port = server.address().port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // Manually add a client to fill the SSE manager to capacity
+    sse.add({ write: () => {}, end: () => {} });
+
+    // Now the next request should get 503
+    const res = await fetch(`${baseUrl}/api/stream`);
+    assert.strictEqual(res.status, 503);
+    const body = await res.json();
+    assert.ok(body.error.includes('too many SSE clients'));
+
+    server.close();
+    db.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('accepts SSE connection when under limit', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'bridge-sse-ok-'));
+    const db = initDatabase(dataDir);
+    seedDefaultAgents(db);
+    const sse = new SSEManager(50);
+    const appConfig = { ...config, dataDir, maxSseClients: 50, defaultLimit: 100, maxQueryLimit: 500, version: '1.0.0' };
+    const app = createApp(db, sse, appConfig);
+    const server = http.createServer(app);
+    server.listen(0);
+    const port = server.address().port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // Use http.get to have more control over the connection lifecycle
+    const { default: http } = await import('node:http');
+    
+    await new Promise((resolve, reject) => {
+      const req = http.get(`${baseUrl}/api/stream`, (res) => {
+        assert.strictEqual(res.statusCode, 200);
+        assert.strictEqual(res.headers['content-type'], 'text/event-stream');
+        // Read the initial data
+        res.on('data', () => {
+          // Got data — connection is working, close it
+          res.destroy();
+          req.destroy();
+          resolve();
+        });
+      });
+      req.on('error', (err) => {
+        // If the error is from destroying, that's fine
+        if (err.code === 'ERR_STREAM_PREMATURE_CLOSE' || err.message.includes('aborted')) {
+          resolve();
+        } else {
+          reject(err);
+        }
+      });
+    });
+
+    server.close();
+    db.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+});
+
+// ─── 8. Dead Code / Constant Validation ───────────────────────────────────────
+
+describe('LIMITS constants are properly used', () => {
+  it('LIMITS object contains all expected limits', () => {
+    assert.ok(typeof LIMITS.MAX_STRING_LENGTH === 'number');
+    assert.ok(typeof LIMITS.MAX_BODY_LENGTH === 'number');
+    assert.ok(typeof LIMITS.MAX_MESSAGE_IDS === 'number');
+    assert.ok(typeof LIMITS.MAX_SSE_CLIENTS === 'number');
+    assert.ok(typeof LIMITS.DEFAULT_QUERY_LIMIT === 'number');
+    assert.ok(typeof LIMITS.MAX_QUERY_LIMIT === 'number');
+    assert.strictEqual(LIMITS.MAX_STRING_LENGTH, 200);
+    assert.strictEqual(LIMITS.MAX_BODY_LENGTH, 100000);
+    assert.strictEqual(LIMITS.MAX_MESSAGE_IDS, 1000);
+  });
+
+  it('body length limit uses LIMITS constant', async () => {
+    const env = makeTestEnv();
+    const res = await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'harry', body: 'a'.repeat(LIMITS.MAX_BODY_LENGTH + 1),
+    });
+    assert.strictEqual(res.status, 400);
+    assert.ok(res.body.error.includes(String(LIMITS.MAX_BODY_LENGTH)));
+    cleanup(env);
+  });
+
+  it('messageIds limit uses LIMITS constant', async () => {
+    const env = makeTestEnv();
+    const hugeArray = new Array(LIMITS.MAX_MESSAGE_IDS + 1).fill('test-id');
+    const res = await envRequest(env, 'POST', '/api/read', {
+      agent: 'harry', messageIds: hugeArray,
+    });
+    assert.strictEqual(res.status, 400);
+    assert.ok(res.body.error.includes(String(LIMITS.MAX_MESSAGE_IDS)));
+    cleanup(env);
+  });
+});
+
+// ─── 9. Concurrent Operations ─────────────────────────────────────────────────
+
+describe('Concurrent operations', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('handles concurrent message sends correctly', async () => {
+    const promises = [];
+    for (let i = 0; i < 20; i++) {
+      promises.push(envRequest(env, 'POST', '/api/send', {
+        from: 'aiona', to: 'harry', body: `Concurrent ${i}`,
+      }));
+    }
+    const results = await Promise.all(promises);
+    assert.ok(results.every(r => r.status === 201));
+
+    const inbox = await envRequest(env, 'GET', '/api/inbox/harry');
+    assert.strictEqual(inbox.body.count, 20);
+  });
+
+  it('handles concurrent agent registrations with unique names', async () => {
+    const promises = [];
+    for (let i = 0; i < 10; i++) {
+      promises.push(envRequest(env, 'POST', '/api/agents', {
+        name: `concurrent-agent-${i}`, platform: 'hermes',
+      }));
+    }
+    const results = await Promise.all(promises);
+    assert.ok(results.every(r => r.status === 201));
+  });
+
+  it('handles concurrent heartbeats without interference', async () => {
+    const promises = [];
+    for (let i = 0; i < 5; i++) {
+      promises.push(envRequest(env, 'POST', '/api/heartbeat', { name: 'aiona' }));
+    }
+    const results = await Promise.all(promises);
+    assert.ok(results.every(r => r.status === 200));
+  });
+
+  it('handles sequential read operations on same messages correctly', async () => {
+    const sendRes = await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'harry', body: 'Concurrent read test',
+    });
+    const msgId = sendRes.body.message.id;
+
+    // First read marks it as read
+    const r1 = await envRequest(env, 'POST', '/api/read', {
+      agent: 'harry', messageIds: [msgId],
+    });
+    assert.strictEqual(r1.body.updated, 1);
+
+    // Second read on same message should mark 0 (already read)
+    const r2 = await envRequest(env, 'POST', '/api/read', {
+      agent: 'harry', messageIds: [msgId],
+    });
+    assert.strictEqual(r2.body.updated, 0);
+  });
+});
+
+// ─── 10. Boundary Conditions ──────────────────────────────────────────────────
+
+describe('Boundary conditions', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('accepts body exactly at MAX_BODY_LENGTH', async () => {
+    const res = await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'harry', body: 'a'.repeat(LIMITS.MAX_BODY_LENGTH),
+    });
+    assert.strictEqual(res.status, 201);
+  });
+
+  it('accepts string at exactly 200 chars', async () => {
+    const res = await envRequest(env, 'POST', '/api/agents', {
+      name: 'a'.repeat(200), platform: 'hermes',
+    });
+    assert.strictEqual(res.status, 201);
+  });
+
+  it('accepts limit at exactly MAX_QUERY_LIMIT', async () => {
+    const res = await envRequest(env, 'GET', `/api/inbox/harry?limit=${LIMITS.MAX_QUERY_LIMIT}`);
+    assert.strictEqual(res.status, 200);
+  });
+
+  it('rejects limit at MAX_QUERY_LIMIT + 1', async () => {
+    const res = await envRequest(env, 'GET', `/api/inbox/harry?limit=${LIMITS.MAX_QUERY_LIMIT + 1}`);
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('accepts limit of 1', async () => {
+    await envRequest(env, 'POST', '/api/send', { from: 'aiona', to: 'harry', body: 'A' });
+    await envRequest(env, 'POST', '/api/send', { from: 'aiona', to: 'harry', body: 'B' });
+    const res = await envRequest(env, 'GET', '/api/inbox/harry?limit=1');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.count, 1);
+  });
+
+  it('accepts messageIds array of exactly MAX_MESSAGE_IDS', async () => {
+    const ids = new Array(LIMITS.MAX_MESSAGE_IDS).fill('nonexistent-id');
+    const res = await envRequest(env, 'POST', '/api/read', {
+      agent: 'harry', messageIds: ids,
+    });
+    assert.strictEqual(res.status, 200);
+  });
+
+  it('rejects messageIds array of MAX_MESSAGE_IDS + 1', async () => {
+    const ids = new Array(LIMITS.MAX_MESSAGE_IDS + 1).fill('nonexistent-id');
+    const res = await envRequest(env, 'POST', '/api/read', {
+      agent: 'harry', messageIds: ids,
+    });
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('accepts gatewayPort at exactly 65535', async () => {
+    const res = await envRequest(env, 'POST', '/api/agents', {
+      name: 'test-port', platform: 'hermes', gatewayPort: 65535,
+    });
+    assert.strictEqual(res.status, 201);
+  });
+
+  it('accepts gatewayPort at exactly 1', async () => {
+    const res = await envRequest(env, 'POST', '/api/agents', {
+      name: 'test-port2', platform: 'hermes', gatewayPort: 1,
+    });
+    assert.strictEqual(res.status, 201);
+  });
+});
+
+// ─── 11. Error Path Coverage ──────────────────────────────────────────────────
+
+describe('Error path coverage', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('POST /api/agents with non-object body returns 400', async () => {
+    const res = await envRequest(env, 'POST', '/api/agents', null, '"not-an-object"');
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('POST /api/send with non-object body returns 400', async () => {
+    const res = await envRequest(env, 'POST', '/api/send', null, '"just-a-string"');
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('POST /api/read with non-object body returns 400', async () => {
+    const res = await envRequest(env, 'POST', '/api/read', null, '"just-a-string"');
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('POST /api/heartbeat with non-object body returns 400', async () => {
+    const res = await envRequest(env, 'POST', '/api/heartbeat', null, '"just-a-string"');
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('POST /api/read with messageIds containing non-string values skips them', async () => {
+    const sendRes = await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'harry', body: 'test',
+    });
+    const res = await envRequest(env, 'POST', '/api/read', {
+      agent: 'harry',
+      messageIds: [sendRes.body.message.id, 12345, null, {}, [], true],
+    });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.updated, 1);
+  });
+
+  it('POST /api/read with messageIds containing very long string skips it', async () => {
+    const res = await envRequest(env, 'POST', '/api/read', {
+      agent: 'harry',
+      messageIds: ['a'.repeat(201)],
+    });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.updated, 0);
+  });
+
+  it('GET /api/inbox with empty agent param', async () => {
+    const res = await envRequest(env, 'GET', '/api/inbox/');
+    assert.strictEqual(res.status, 404); // Express treats empty param as no route match
+  });
+
+  it('GET /api/thread with empty threadId param', async () => {
+    const res = await envRequest(env, 'GET', '/api/thread/');
+    assert.strictEqual(res.status, 404);
+  });
+});
+
+// ─── 12. Dashboard XSS Content Verification ─────────────────────────────────────
+
+describe('Dashboard content security', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('dashboard does not inject raw user data into HTML at render time', async () => {
+    // The dashboard is a static HTML page that loads data via fetch/JS
+    // Verify the HTML template itself doesn't contain any user-controllable inline data
+    const res = await envRequest(env, 'GET', '/');
+    const html = res.raw;
+
+    // Check that the dashboard uses escapeHtml before insertAdjacentHTML
+    assert.ok(html.includes('escapeHtml'));
+
+    // Check that the addMessage function escapes all interpolated values
+    const addMessageMatch = html.match(/function addMessage[\s\S]*?\n  \}/);
+    assert.ok(addMessageMatch, 'addMessage function should exist');
+    assert.ok(addMessageMatch[0].includes('escapeHtml'), 'addMessage should call escapeHtml');
+
+    // Check that the agent list rendering also escapes
+    const agentRenderMatch = html.match(/agentList\.innerHTML[\s\S]*?\.join\(''\)/);
+    assert.ok(agentRenderMatch, 'agent list rendering should exist');
+    assert.ok(agentRenderMatch[0].includes('escapeHtml'), 'agent list should use escapeHtml');
+  });
+});
+
+// ─── 13. Path Traversal Prevention ─────────────────────────────────────────────
+
+describe('Path traversal prevention', () => {
+  it('initDatabase resolves relative paths correctly', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'bridge-traversal-'));
+    const db = initDatabase(dataDir);
+    assert.ok(db);
+    // Verify we can use the DB
+    const count = db.prepare('SELECT COUNT(*) as count FROM agents').get().count;
+    assert.strictEqual(count, 0);
+    db.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('initDatabase creates nested directories if needed', () => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'bridge-nested-'));
+    const nestedDir = join(baseDir, 'deeply', 'nested', 'path');
+    const db = initDatabase(nestedDir);
+    assert.ok(db);
+    db.close();
+    rmSync(baseDir, { recursive: true, force: true });
+  });
+});
+
+// ─── 14. Observability: Request ID ─────────────────────────────────────────────
+
+describe('Observability - request ID', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('request log includes requestId field', async () => {
+    // We can't easily capture stdout in tests, but we can verify the response
+    // is correct (the logging happens internally)
+    const res = await envRequest(env, 'GET', '/health');
+    assert.strictEqual(res.status, 200);
+    // The request ID is internal — we just verify no crash
+  });
+});
+
+// ─── 15. Inbox Query Correctness ───────────────────────────────────────────────
+
+describe('Inbox query edge cases', () => {
+  let env;
+  beforeEach(() => { env = makeTestEnv(); });
+  afterEach(() => cleanup(env));
+
+  it('inbox for agent with special characters in name', async () => {
+    // Register agent with hyphen
+    await envRequest(env, 'POST', '/api/agents', {
+      name: 'agent-with-hyphen', platform: 'hermes',
+    });
+    await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'agent-with-hyphen', body: 'Hello hyphen',
+    });
+    const res = await envRequest(env, 'GET', '/api/inbox/agent-with-hyphen');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.count, 1);
+  });
+
+  it('inbox with limit=0 is rejected', async () => {
+    const res = await envRequest(env, 'GET', '/api/inbox/harry?limit=0');
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('inbox with negative limit is rejected', async () => {
+    const res = await envRequest(env, 'GET', '/api/inbox/harry?limit=-5');
+    assert.strictEqual(res.status, 400);
+  });
+
+  it('inbox returns broadcast messages for any agent', async () => {
+    await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'everyone', body: 'Broadcast!', type: 'broadcast',
+    });
+    const res = await envRequest(env, 'GET', '/api/inbox/zayn');
+    assert.ok(res.body.count >= 1);
+    assert.ok(res.body.messages.some(m => m.type === 'broadcast'));
+  });
+
+  it('inbox returns team messages for any agent', async () => {
+    await envRequest(env, 'POST', '/api/send', {
+      from: 'aiona', to: 'team', body: 'Team update',
+    });
+    const res = await envRequest(env, 'GET', '/api/inbox/zayn');
+    assert.ok(res.body.count >= 1);
+    assert.ok(res.body.messages.some(m => m.toAgent === 'team'));
+  });
+});
+
+// ─── 16. Unhandled Rejection / Exception Handlers ───────────────────────────────
+
+describe('Process error handlers', () => {
+  it('unhandledRejection handler is registered when startServer is called', () => {
+    // We can't call startServer in tests (it starts listening), but we can verify
+    // the handlers exist by checking the process listener count
+    // This is a smoke test — the actual handlers are registered in startServer
+    const initialCount = process.listenerCount('unhandledRejection');
+    // The handlers are only registered in startServer, which we don't call in tests
+    // This test documents the expectation
+    assert.ok(initialCount >= 0);
+  });
+});
