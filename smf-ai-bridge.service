@@ -5,20 +5,32 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# NOTE: Update these paths to match your installation
+# --- paths (required edit) ---
+# This unit is a template. Replace /opt/smf-ai-bridge with your clone path
+# before enabling.
+#
+# User unit (matches the README):
+#   mkdir -p ~/.config/systemd/user
+#   cp smf-ai-bridge.service ~/.config/systemd/user/
+#   # edit the three paths below, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now smf-ai-bridge
+#
+# System-wide alternative: copy to /etc/systemd/system/ and use systemctl
+# (not --user). WantedBy=default.target is for the user-session install.
 ExecStart=/usr/bin/env node /opt/smf-ai-bridge/server.js
 WorkingDirectory=/opt/smf-ai-bridge
 Restart=always
 RestartSec=3
 
-# Environment configuration
+# Same knobs as .env.example — exported here because Node does not load .env
 Environment=PORT=8700
 Environment=HOST=127.0.0.1
 Environment=BRIDGE_DATA_DIR=/opt/smf-ai-bridge/data
 Environment=LOG_LEVEL=info
 Environment=MAX_SSE_CLIENTS=50
 
-# Graceful shutdown
+# Graceful shutdown (server.js handles SIGTERM)
 KillSignal=SIGTERM
 TimeoutStopSec=10
 

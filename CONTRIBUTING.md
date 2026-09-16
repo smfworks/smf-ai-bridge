@@ -1,8 +1,8 @@
 # Contributing to SMF AI Bridge
 
-Thank you for your interest in contributing! This document covers the development workflow and standards.
+Useful notes for changing this repo. The public how-to-run path is in [README.md](README.md).
 
-## Development Setup
+## Setup
 
 ```bash
 git clone https://github.com/smfworks/smf-ai-bridge.git
@@ -10,103 +10,66 @@ cd smf-ai-bridge
 npm install
 ```
 
-Prerequisites:
-- Node.js 18+
-- npm
+Node.js 18+ and npm. Native compile for `better-sqlite3` needs a working C toolchain (usual on Linux).
 
-## Development Workflow
+## Tests
 
-1. **Create a branch** from `main`:
-   ```bash
-   git checkout -b feat/your-feature-name
-   ```
+This is the command CI runs:
 
-2. **Make your changes.** Keep the existing API surface backward-compatible unless explicitly discussed.
+```bash
+npm test
+```
 
-3. **Run tests** — they must all pass:
-   ```bash
-   npm test
-   ```
+Same suite, more noise / coverage:
 
-4. **Run with coverage** to verify meaningful paths are covered:
-   ```bash
-   npm run test:coverage
-   ```
+```bash
+npm run test:verbose
+npm run test:coverage
+```
 
-5. **Commit with conventional commit messages:**
-   ```bash
-   git commit -m "feat: add new endpoint for X"
-   git commit -m "fix: handle edge case in Y"
-   git commit -m "docs: update API reference"
-   git commit -m "test: add coverage for Z"
-   git commit -m "refactor: extract validation logic"
-   ```
+`npm test` is `node --test test/*.test.js` — Node's built-in runner, no Jest/Mocha. Each test spins up an isolated temp database. Files named `*.test.js.skip` are not picked up.
 
-6. **Push and open a PR.** CI will run automatically.
+If you add an endpoint or a validation branch, add a test next to the existing cases in `test/server.test.js`. Cover success, 4xx, and at least one edge (empty body, unknown agent, bad enum).
 
-## Commit Message Convention
+Manual check against a live process:
 
-Use [Conventional Commits](https://www.conventionalcommits.org/):
+```bash
+npm start   # other terminal
+bash examples/two-agents-chat.sh
+bash examples/heartbeat-unread.sh
+```
 
-| Type | Use for |
-|------|---------|
-| `feat` | New features |
-| `fix` | Bug fixes |
-| `docs` | Documentation changes |
-| `test` | Test additions/changes |
-| `refactor` | Code restructuring (no behavior change) |
-| `perf` | Performance improvements |
-| `chore` | Maintenance tasks |
-| `ci` | CI/CD changes |
+## Workflow
 
-Format: `type: brief description`
+1. Branch from `main`.
+2. Keep the HTTP contract backward-compatible unless the PR says otherwise.
+3. `npm test` must pass.
+4. Conventional commits (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, `ci:`).
+5. Open a PR. GitHub Actions runs the same `npm test` on Node 18, 20, 22, and 24.
 
-## Code Standards
+## Code standards
 
-- **ES Modules** — the project uses `"type": "module"` in package.json
-- **No new runtime dependencies** unless absolutely necessary — prefer Node built-ins
-- **Input validation** — all new endpoints must validate and sanitize input
-- **Error handling** — all new endpoints must have try/catch with structured error responses
-- **Structured logging** — use the `log()` function, not `console.log`
-- **Parameterized queries** — never concatenate SQL strings
+- ES modules (`"type": "module"`).
+- No new runtime dependencies unless there is no built-in alternative.
+- Validate and sanitize every new input. Parameterized SQL only. Use `log()`, not `console.log`.
+- New routes: try/catch and a JSON error body.
 
-## Testing Standards
+The server is one file on purpose (`server.js`):
 
-- Write tests for all new endpoints and code paths
-- Cover success cases, error cases, and edge cases
-- Tests use Node's built-in test runner (`node:test`) — no Jest, no Mocha
-- Each test creates an isolated temp database — no shared state between tests
-- Aim for >80% coverage of meaningful code paths
+- `parseConfig()` — env with defaults
+- `initDatabase()` / `seedDefaultAgents()`
+- `SSEManager`
+- `createApp(db, sse, config)` — Express app used by production and tests
+- SIGTERM/SIGINT close SSE then the DB
 
-## Architecture Notes
+## Pull request checklist
 
-The server is intentionally a single file (`server.js`) for simplicity. Key components:
+- [ ] `npm test`
+- [ ] No surprise runtime deps
+- [ ] New inputs validated; errors structured
+- [ ] Tests for new paths
+- [ ] Docs/examples still match the code (curl paths, body fields)
 
-- **Config object** — all environment variables with defaults
-- **Validation helpers** — `isValidString`, `validateEnum`, `validateInteger`
-- **Database initialization** — `initDatabase()` creates tables and indexes
-- **SSE Manager** — class managing SSE client connections with limits
-- **App factory** — `createApp()` returns an Express app (used by both server and tests)
-- **Graceful shutdown** — SIGTERM/SIGINT handlers close DB and SSE connections
+## Issues
 
-The `createApp()` factory pattern allows tests to create isolated app instances with their own databases, ensuring no shared state between test runs.
-
-## Pull Request Checklist
-
-- [ ] All tests pass (`npm test`)
-- [ ] No new runtime dependencies added (or justified)
-- [ ] Input validation on new endpoints
-- [ ] Error handling on new endpoints
-- [ ] Tests cover new code paths
-- [ ] Conventional commit messages
-- [ ] Backward compatibility maintained
-
-## Reporting Issues
-
-Use [GitHub Issues](https://github.com/smfworks/smf-ai-bridge/issues) to report bugs or request features. Include:
-
-- Node.js version
-- Operating system
-- Steps to reproduce
-- Expected vs actual behavior
-- Relevant log output (with `LOG_LEVEL=debug`)
+[GitHub Issues](https://github.com/smfworks/smf-ai-bridge/issues): Node version, OS, steps, expected vs actual, and a `LOG_LEVEL=debug` snippet if it helps.
